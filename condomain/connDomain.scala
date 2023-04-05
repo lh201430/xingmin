@@ -1,0 +1,634 @@
+package xingmin.condomain
+
+import com.sun.org.apache.xml.internal.security.Init
+import spinal.core
+import spinal.core._
+import spinal.lib.{Delay, Flow, StreamFifo, master, slave}
+import sun.awt.OSInfo.OSType
+import wa.{StreamDataWidthConvert, WaCounter, xMul}
+import xingmin.memory.math.Mul
+
+import javax.print.attribute.standard.MediaSize.Other
+
+//FEATURE_WIDTH: Int,FEATURE_LENGTH: Int
+case class ConnDomainConfig(DATA_WIDTH: Int, FEATURE_W: Int, FEATURE_H: Int, ROW_MEM_DEPTH: Int) { //32 11(2040) 2040 用来缓存数据（2040）
+  val STREAM_DATA_WIDTH = DATA_WIDTH * 4
+}
+
+object ComputeEnum extends SpinalEnum(defaultEncoding = binaryOneHot) {
+  val IDLE, INIT,Judge, UPLEFT0, UP0LEFT, UP1LEFT,UP1LEFT1,END= newElement
+}
+
+object JudgeLEFTEnum extends SpinalEnum(defaultEncoding = binaryOneHot) {
+  val IDLE, ONE, TWO, THREE, FOUR= newElement
+}
+
+case class JudgeLEFTFsm(start: Bool) extends Area {
+
+  val left2 = Bool()
+  val left3 = Bool()
+  val left4 = Bool()
+
+  val currentState = Reg(JudgeLEFTEnum()) init JudgeLEFTEnum.IDLE
+  val nextState = JudgeLEFTEnum()
+  currentState := nextState
+
+  switch(currentState) {
+    is(JudgeLEFTEnum.IDLE) {
+      when(start) {
+        nextState := JudgeLEFTEnum.ONE
+      } otherwise {
+        nextState := JudgeLEFTEnum.IDLE
+      }
+    }
+
+    is(JudgeLEFTEnum.ONE) {
+      when(left2) {
+        nextState := JudgeLEFTEnum.TWO
+      } otherwise {
+        nextState := JudgeLEFTEnum.IDLE
+      }
+    }
+
+    is(JudgeLEFTEnum.TWO) {
+      when(left3) {
+        nextState := JudgeLEFTEnum.THREE
+      } otherwise {
+        nextState := JudgeLEFTEnum.IDLE
+      }
+    }
+
+    is(JudgeLEFTEnum.THREE) {
+      when(left4) {
+        nextState := JudgeLEFTEnum.FOUR
+      } otherwise {
+        nextState := JudgeLEFTEnum.IDLE
+      }
+    }
+
+
+    is(JudgeLEFTEnum.FOUR) {
+      nextState := JudgeLEFTEnum.IDLE
+    }
+
+  }
+
+
+}
+
+
+
+
+
+
+case class ComputeFsm(start: Bool) extends Area {
+  val endEnd = Bool() //是否为最后一个数据
+  val finsish = Bool()
+  val init = Bool()
+  val Zeroing = Bool()//清零
+  val judge = Bool() //1为  图片小于阈值（upmem标为0）
+  val delaySign= Bool()
+  val delayUp= Bool()
+  val delayLeft = Bool()
+
+  val upleft0 = Bool() //上左都没有
+  val up0left = Bool()
+  val up1left = Bool()
+  val up1lef1 = Bool()
+  val delayUpLeft =Bool()
+
+  val currentState = Reg(ComputeEnum()) init ComputeEnum.IDLE
+  val nextState = ComputeEnum()
+  currentState := nextState
+
+  switch(currentState) {
+
+
+
+
+    is(ComputeEnum.IDLE) {
+      when(start) {
+        nextState := ComputeEnum.INIT
+      } otherwise {
+        nextState := ComputeEnum.IDLE
+      }
+    }
+
+    is(ComputeEnum.INIT) {
+      when(Zeroing) {
+        nextState := ComputeEnum.Judge
+      } otherwise {
+        nextState := ComputeEnum.INIT
+      }
+    }
+
+
+
+    is(ComputeEnum.Judge) {
+      when(init){
+        when(upleft0) {
+          nextState := ComputeEnum.UPLEFT0
+        } elsewhen (up0left) {
+          nextState := ComputeEnum.UP0LEFT
+        } elsewhen (up1left) {
+          nextState := ComputeEnum.UP1LEFT
+        }elsewhen (up1lef1){
+          nextState := ComputeEnum.UP1LEFT1
+        } elsewhen (endEnd) {
+          nextState := ComputeEnum.END
+        }otherwise {
+          nextState := ComputeEnum.Judge
+        }
+
+
+      }otherwise{
+        nextState := ComputeEnum.Judge
+      }
+
+
+
+
+    }
+
+
+
+
+    is(ComputeEnum.UPLEFT0) {
+      when(endEnd) {
+        nextState := ComputeEnum.END
+      } elsewhen (delaySign){
+        nextState := ComputeEnum.Judge
+      } otherwise {
+        nextState := ComputeEnum.UPLEFT0
+      }
+
+    }
+    is(ComputeEnum.UP0LEFT) {
+      when(endEnd) {
+        nextState := ComputeEnum.END
+      } elsewhen (delayLeft) {
+        nextState := ComputeEnum.Judge
+      }otherwise {
+        nextState := ComputeEnum.UP0LEFT
+      }
+    }
+
+    is(ComputeEnum.UP1LEFT) {
+      when(endEnd) {
+        nextState := ComputeEnum.END
+      } elsewhen (delayUp) {
+        when(Delay(up1lef1,5)){
+          nextState := ComputeEnum.UP1LEFT1
+        }otherwise {
+          nextState := ComputeEnum.Judge
+        }
+      } otherwise {
+        nextState := ComputeEnum.UP1LEFT
+      }
+    }
+
+
+    is(ComputeEnum.UP1LEFT1){
+      when(endEnd) {
+        nextState := ComputeEnum.END
+      } elsewhen (delayUpLeft) {
+        nextState := ComputeEnum.Judge
+      } otherwise {
+        nextState := ComputeEnum.UP1LEFT1
+      }
+    }
+
+
+    is(ComputeEnum.END){
+
+      when(finsish){
+        nextState := ComputeEnum.IDLE
+      }otherwise{
+        nextState := ComputeEnum.END
+      }
+
+
+
+    }
+
+
+
+  }
+}
+
+
+class connDomain(connDomainConfig: ConnDomainConfig) extends Component {
+
+  val io = new Bundle {
+    val start = in Bool()
+    val sData = slave Stream UInt(connDomainConfig.STREAM_DATA_WIDTH bits)
+    val threshold = in UInt (connDomainConfig.DATA_WIDTH bits) //阈值s
+    val tempBackMean = in UInt (connDomainConfig.DATA_WIDTH bits)
+    val mData = master Flow (UInt(272 bits))
+    val connCount = out UInt (connDomainConfig.DATA_WIDTH bits)
+    val last = out Bool()
+    val signBit= in Bool()
+    val dy_finish= out Bool()
+  }
+  noIoPrefix()
+  //要进行的数据
+  val inputFeature = Flow(UInt(connDomainConfig.DATA_WIDTH bits))
+
+
+
+
+  //fifo 用于存数据
+  val dataTemp = StreamFifo(UInt(connDomainConfig.STREAM_DATA_WIDTH bits), connDomainConfig.ROW_MEM_DEPTH)
+  dataTemp.io.push.payload := io.sData.payload
+  dataTemp.io.push.valid := io.sData.fire
+
+ // io.sData.ready := dataTemp.io.push.ready
+
+
+
+
+  dataTemp.setDefinitionName("LhFifo" )
+
+  //出来要进行处理的数据
+  val dataCvt = StreamDataWidthConvert(connDomainConfig.STREAM_DATA_WIDTH, connDomainConfig.DATA_WIDTH, "connDomain64to16", true)
+  dataCvt.io.sData <> dataTemp.io.pop
+  inputFeature.payload := dataCvt.io.mData.payload
+  inputFeature.valid := dataCvt.io.mData.fire
+
+
+  dataCvt.io.mData.ready.set()
+
+
+
+  //状态机
+  val fsm = ComputeFsm(io.start)
+
+  val columnCnt = WaCounter(inputFeature.valid, log2Up(connDomainConfig.FEATURE_W), connDomainConfig.FEATURE_W - 1)
+  val rowCnt = WaCounter(columnCnt.valid, log2Up(connDomainConfig.FEATURE_H), connDomainConfig.FEATURE_H - 1)
+  val totalCnt = WaCounter(inputFeature.valid, log2Up(connDomainConfig.FEATURE_W) * log2Up(connDomainConfig.FEATURE_H), connDomainConfig.FEATURE_W * connDomainConfig.FEATURE_H - 1)
+  val zeroCnt= WaCounter(fsm.currentState===ComputeEnum.INIT, log2Up(connDomainConfig.FEATURE_W), connDomainConfig.FEATURE_W- 1)
+  val count = Reg(UInt(connDomainConfig.DATA_WIDTH bits)) init 0
+  val outCount =  WaCounter(fsm.currentState===ComputeEnum.END, connDomainConfig.DATA_WIDTH, count-1)//输出的
+
+
+
+  fsm.endEnd := totalCnt.valid
+  fsm.init := inputFeature.valid
+
+  when(fsm.currentState === ComputeEnum.INIT) {
+    io.sData.ready.clear()
+  } otherwise {
+    io.sData.ready := dataTemp.io.push.ready
+  }
+
+
+
+
+  val rdAddr = Reg(UInt(log2Up(connDomainConfig.FEATURE_W) bits)) init 0   //改过
+  val wrAddr = RegNext(rdAddr)
+  val tempData = UInt(36 bits)
+  when(io.signBit===True){
+    tempData:= (U(0,8 bits)@@(inputFeature.payload<<12)) + io.tempBackMean
+  }otherwise {
+    tempData:= (U(0,8 bits)@@(inputFeature.payload<<12)) - io.tempBackMean
+  }
+
+
+
+  val uplist: List[UInt] = List.fill(2040)(0)
+  val upmem = Mem(UInt(connDomainConfig.DATA_WIDTH bits),connDomainConfig.FEATURE_W)   // initialContent = uplist
+
+  val upDate = upmem.readSync(rdAddr) //用于mark 的判断
+  val upData1= upmem.readSync(rdAddr-3)
+  val upData2= upmem.readSync(rdAddr-4)
+  val upData3= upmem.readSync(rdAddr-5)
+
+
+  //存左边的数
+  val left = Reg(UInt(connDomainConfig.DATA_WIDTH bits)) init 0
+  val left1 = UInt(connDomainConfig.DATA_WIDTH bits)
+  val left2 = UInt(connDomainConfig.DATA_WIDTH bits)
+  val left3 = UInt(connDomainConfig.DATA_WIDTH bits)
+  left1 :=0
+  left2 :=0
+  left3 :=0
+
+  val value = UInt(connDomainConfig.DATA_WIDTH bits)
+  value := 0
+
+
+
+  val endAddr = UInt(connDomainConfig.DATA_WIDTH bits)
+  when(upDate =/= 0 && left =/= 0) {
+    endAddr := upDate
+  } elsewhen (upDate > left) {
+    endAddr := upDate
+  } otherwise {
+    endAddr := left
+  }
+
+  //最后的mem
+
+  val endmem = Mem(UInt(272 bits), wordCount = 2048) // 16  64 64 56 36 36   176
+  val endDate = endmem.readSync(Delay(endAddr(10 downto 0),9))   //延迟9拍  GAIGUOLE
+  val endDate1 = endmem.readSync(Delay(endAddr(10 downto 0),4))
+  val address = UInt(log2Up(connDomainConfig.FEATURE_W) bits)//改过
+  address :=0
+
+  fsm.Zeroing := zeroCnt.valid
+  fsm.judge := (inputFeature.payload <= io.threshold) ? True | False
+  fsm.upleft0 := (upDate === 0 && left === 0 && inputFeature.payload > io.threshold) ? True | False
+  fsm.up0left := (upDate === 0 && left =/= 0 && inputFeature.payload > io.threshold) ? True | False
+  fsm.up1left := (upDate =/= 0 && (left === 0||left===upDate)&&inputFeature.payload > io.threshold) ? True | False
+  fsm.up1lef1 := (upDate =/= 0 && upDate =/= left&& left =/= 0 && inputFeature.payload > io.threshold)
+  fsm.delaySign:= RegNext(RegNext(RegNext(fsm.upleft0)))
+  fsm.delayUp := Delay(fsm.up1left,5)
+  fsm.delayLeft:= Delay(fsm.up0left,5)
+  fsm.delayUpLeft:= Delay(fsm.up1lef1,10)
+
+  val xinFsm = JudgeLEFTFsm(fsm.up1lef1)
+  xinFsm.left2 := (left1 =/= 0 && left1 =/= upDate)
+  xinFsm.left3 := (left2 =/= 0 && left2 =/= upDate)
+  xinFsm.left4:= (left3 =/= 0 && left3 =/= upDate)
+
+
+
+  val Attributes = UInt(272 bits)  // 16  64 64 56 36 36   176  (15 downto 0)  (79 downto 16) (143 downto 80)   Attributes(199 downto 144) (235 downto 200) (271 downto 236)
+  Attributes:=0
+  val two = UInt(64 bits)
+  val three = UInt(64 bits)
+  val four = UInt(56 bits)
+  val five = Reg(UInt(36 bits)) init 0
+  val judgeLeft = Reg(UInt(3 bits)) init 0
+  //乘法运算
+
+  val mul = Mul(36, 36, 56, "Unsigned", "Unsigned", 1, "DSP", this.clockDomain, "Mul")
+  mul.io.A <> tempData
+  mul.io.B <> tempData
+  mul.io.P <> four
+//gaiguo
+  val mul1 = Mul(56, 11, 64, "Unsigned", "Unsigned", 2, "DSP", this.clockDomain, "nextMul")
+  mul1.io.A <> mul.io.P
+  mul1.io.B := rowCnt.count+5//U(0,1 bits)@@(rowCnt.count+5)//rowCnt.count+5
+  mul1.io.P <> two
+
+  val mul2 = Mul(56, 11, 64, "Unsigned", "Unsigned", 2, "DSP", this.clockDomain, "twoMul")
+  mul2.io.A <> mul.io.P
+  mul2.io.B <> columnCnt.count+4//U(0,1 bits)@@(columnCnt.count+4)
+  mul2.io.P <> three
+
+
+  when(fsm.currentState === ComputeEnum.UPLEFT0||fsm.currentState === ComputeEnum.UP1LEFT||fsm.currentState === ComputeEnum.UP0LEFT||fsm.currentState ===ComputeEnum.UP1LEFT1){
+    dataCvt.io.mData.ready.clear()
+
+  }
+
+
+
+  when(fsm.currentState === ComputeEnum.UPLEFT0 && fsm.nextState === ComputeEnum.Judge) {
+    Attributes(15 downto 0):=U"0000000000000001"
+    endAddr:= count
+
+    // endmem.write(count(9 downto 0), Attributes)
+    Attributes(79 downto 16):= two
+    Attributes(143 downto 80):=three
+    Attributes(199 downto 144):=RegNext(RegNext(four))
+    Attributes(235 downto 200) := five
+    Attributes(271 downto 236) := five
+    left := count
+
+
+  }
+
+  when ((fsm.currentState === ComputeEnum.UP1LEFT||fsm.currentState ===ComputeEnum.UP0LEFT) && fsm.nextState === ComputeEnum.Judge){
+    Attributes(15 downto 0):=U"0000000000000001"+endDate1(15 downto 0)
+    Attributes(79 downto 16):=Delay(two,2)+endDate1(79 downto 16)
+    Attributes(143 downto 80):=Delay(three,2)+endDate1(143 downto 80)
+    Attributes(199 downto 144):=Delay(four,4)+endDate1(199 downto 144)
+    Attributes(235 downto 200) := five+endDate1(235 downto 200)
+    Attributes(271 downto 236) := (five > endDate1(271 downto 236)) ? five | endDate1(271 downto 236)
+    left := Delay(endAddr,5)
+    endAddr:=Delay(endAddr,5)
+
+
+
+  }
+//修改 ****************************************
+//   *2变成<<1
+
+  //*******************************************
+  when((fsm.currentState === ComputeEnum.UP1LEFT1) && fsm.nextState === ComputeEnum.Judge) {
+
+
+    left := Delay(endAddr,10)
+    when(judgeLeft===1){
+      Attributes(15 downto 0) := U"0000000000000010" + endDate(15 downto 0)
+      Attributes(79 downto 16) := Delay(two(62 downto 0)<<1, 7) + endDate(79 downto 16)
+      Attributes(143 downto 80) := Delay(three(62 downto 0)<<1, 7) + endDate(143 downto 80)-Delay(four, 9)
+      Attributes(199 downto 144) := Delay(four, 9)+Delay(four, 9) + endDate(199 downto 144)
+      Attributes(235 downto 200) := five+five + endDate(235 downto 200)
+      Attributes(271 downto 236) := (five > endDate(271 downto 236)) ? five | endDate(271 downto 236)
+      endAddr:=Delay(endAddr,10)
+
+    }
+
+    when(judgeLeft === 2) {
+      Attributes(15 downto 0) := U"0000000000000011" + endDate(15 downto 0)
+      Attributes(79 downto 16) := Delay(two(62 downto 0)<<1, 7) +  Delay(two, 7)+ endDate(79 downto 16)
+      Attributes(143 downto 80) := Delay(three(62 downto 0)<<1, 7) +Delay(three,7) + endDate(143 downto 80) - Delay(four, 9)*3
+      Attributes(199 downto 144) := Delay(four(54 downto 0)<<1, 9) +Delay(four,9) + endDate(199 downto 144)
+      Attributes(235 downto 200) := five +five+five + endDate(235 downto 200)
+      Attributes(271 downto 236) := (five > endDate(271 downto 236)) ? five | endDate(271 downto 236)
+      endAddr:=Delay(endAddr,10)
+
+    }
+
+    when(judgeLeft === 3) {
+      Attributes(15 downto 0) := U"0000000000000100" + endDate(15 downto 0)
+      Attributes(79 downto 16) := Delay(two(60 downto 0), 7) * 3+ Delay(two, 7)+ endDate(79 downto 16)
+      Attributes(143 downto 80) := Delay(three(60 downto 0), 7) * 3+ Delay(three, 7) + endDate(143 downto 80) - (Delay(four, 9)<<2)- (Delay(four, 9)<<1)
+      Attributes(199 downto 144) := Delay(four(52 downto 0), 9) * 4 + endDate(199 downto 144)
+      Attributes(235 downto 200) := five + five + five+ five + endDate(235 downto 200)
+      Attributes(271 downto 236) := (five > endDate(271 downto 236)) ? five | endDate(271 downto 236)
+      endAddr:=Delay(endAddr,10)
+
+    }
+
+    when(judgeLeft === 4) {
+      Attributes(15 downto 0) := U"0000000000000101" + endDate(15 downto 0)
+      Attributes(79 downto 16) := Delay(two(60 downto 0), 7) * 3+ Delay(two, 7)+ Delay(two, 7) + endDate(79 downto 16)
+      Attributes(143 downto 80) := Delay(three(60 downto 0), 7) * 3+ Delay(three, 7)+ Delay(three, 7) + endDate(143 downto 80) - (Delay(four, 9) <<3)-(Delay(four, 9)<<1)
+      Attributes(199 downto 144) := Delay(four(52 downto 0), 9) * 5 + endDate(199 downto 144)
+      Attributes(235 downto 200) := five + five + five + five+ five+ endDate(235 downto 200)
+      Attributes(271 downto 236) := (five > endDate(271 downto 236)) ? five | endDate(271 downto 236)
+      endAddr:=Delay(endAddr,10)
+
+    }
+
+
+  }
+
+
+
+  when(xinFsm.currentState===JudgeLEFTEnum.ONE){//2
+    address := wrAddr - 2
+    value := RegNext(upDate)
+    endAddr(9 downto 0):= left(9 downto 0)
+    Attributes:=U(0, 272 bits)
+    left1 := upData1
+  }elsewhen(xinFsm.currentState===JudgeLEFTEnum.TWO){//4
+    address := wrAddr - 3
+    value := Delay(value,2)
+    left2 := upData2
+    judgeLeft := 2
+  }elsewhen(xinFsm.currentState===JudgeLEFTEnum.THREE){//8
+    address := wrAddr -4
+    value := Delay(value,3)
+    left3 := upData3
+    judgeLeft := 3
+  } elsewhen (xinFsm.currentState === JudgeLEFTEnum.FOUR) {//10
+    address := wrAddr - 5
+    value := Delay(value, 4)
+    judgeLeft := 4
+  }
+
+
+
+
+
+  when(xinFsm.currentState===JudgeLEFTEnum.ONE||((fsm.currentState === ComputeEnum.UP1LEFT1 || fsm.currentState === ComputeEnum.UPLEFT0 || fsm.currentState === ComputeEnum.UP1LEFT || fsm.currentState === ComputeEnum.UP0LEFT) && fsm.nextState === ComputeEnum.Judge)) {
+    endmem.write(endAddr(10 downto 0), Attributes)
+  }
+
+//GAIGAGIAGIA
+  when(Delay(fsm.currentState===ComputeEnum.INIT&&fsm.nextState===ComputeEnum.Judge,3)){
+    rdAddr := rdAddr+1
+
+  }
+
+
+
+  when(inputFeature.valid){
+
+    when(rdAddr === connDomainConfig.FEATURE_W - 1&&fsm.nextState===ComputeEnum.Judge) {//改过
+      rdAddr := 0
+    } elsewhen (fsm.up1left|fsm.up0left|fsm.upleft0|fsm.up1lef1) {
+      rdAddr := rdAddr
+    } otherwise {
+      rdAddr := rdAddr + 1
+    }
+
+
+    when(fsm.upleft0) {
+      address := wrAddr
+      value:=count + 1
+      count := count + 1
+      five := tempData
+
+    }
+
+    when(fsm.up1left) {
+      address := wrAddr
+      value := upDate
+      five := tempData
+    }
+
+    when(fsm.up1lef1) {
+      address := wrAddr
+      five := tempData
+      value := upDate
+      judgeLeft := 1
+
+    }
+
+
+    when(fsm.up0left) {
+      address := wrAddr
+      value := left
+      five := tempData
+    }
+
+
+    when(fsm.judge) {
+      address := wrAddr
+      value := U(0, 16 bits)
+      left := U(0, 16 bits)
+    }
+
+
+
+  }otherwise {
+    when((fsm.currentState === ComputeEnum.UPLEFT0 || fsm.currentState === ComputeEnum.UP1LEFT|| fsm.currentState ===ComputeEnum.UP0LEFT||fsm.currentState ===ComputeEnum.UP1LEFT1) && fsm.nextState === ComputeEnum.Judge && rdAddr === connDomainConfig.FEATURE_W - 1) {
+      rdAddr := 0
+    }elsewhen((fsm.currentState === ComputeEnum.UPLEFT0 || fsm.currentState === ComputeEnum.UP1LEFT|| fsm.currentState ===ComputeEnum.UP0LEFT||fsm.currentState ===ComputeEnum.UP1LEFT1) && fsm.nextState === ComputeEnum.Judge) {
+      rdAddr := rdAddr + 1
+    }
+    fsm.up0left := False
+    fsm.up1left := False
+    fsm.up1lef1 := False
+    fsm.upleft0 := False
+
+  }
+
+
+  when(fsm.currentState===ComputeEnum.INIT){
+    address:=zeroCnt.count
+  }
+  when(fsm.currentState===ComputeEnum.INIT||inputFeature.valid||xinFsm.currentState===JudgeLEFTEnum.ONE||xinFsm.currentState===JudgeLEFTEnum.TWO||xinFsm.currentState===JudgeLEFTEnum.THREE||xinFsm.currentState===JudgeLEFTEnum.FOUR) {
+    upmem.write(address, value)
+  }
+
+
+//  io.dy_finish := False
+//  when(fsm.currentState === ComputeEnum.END) {
+//    io.dy_finish := True
+//
+//  }
+
+
+
+  when(fsm.currentState===ComputeEnum.END||fsm.currentState === ComputeEnum.IDLE||fsm.currentState === ComputeEnum.INIT) {
+    dataCvt.io.mData.ready.clear()
+    rdAddr:=0
+
+  }
+
+
+  when(io.start){
+    count:=0
+  }
+
+
+
+  //val outReg = outCount.valid
+    io.last:=RegNext(outCount.valid)
+    fsm.finsish:=outCount.valid
+    io.dy_finish:=totalCnt.valid
+
+  val outValue=endmem.readSync(outCount.count(10 downto 0)+1)
+  io.mData.payload := outValue
+  io.mData.valid := RegNext(fsm.currentState===ComputeEnum.END)
+  io.connCount := count
+
+//
+//  val sortstar = new sortStar(272,64,16)
+//  sortstar.io.dataIn.payload := io.mData.payload
+//  sortstar.io.dataIn.valid:=io.mData.valid
+////  val ready = Bool()
+////  ready:=sortstar.io.dataIn.ready
+//  io.mData.ready:=sortstar.io.dataIn.ready
+//
+//
+//  sortstar.io.connCount:=io.connCount
+//  sortstar.io.start:=io.last
+//  sortstar.io.mData.ready:= True
+
+
+}
+
+
+
+
+//object connDomain extends App {
+//  SpinalVerilog(new connDomain(ConnDomainConfig(16, 1192, 1192, 2040))).printPruned()
+//}
